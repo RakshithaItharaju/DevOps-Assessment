@@ -26,28 +26,12 @@ Architecture
 
 Setup Instructions
 
-Clone the repository:
-
-git clone <YOUR_REPOSITORY_URL>
-cd <PROJECT_DIRECTORY>
-
-Build Docker images:
-
 docker compose build
-
-Start the application:
-
 docker compose up -d
-
-Check running containers:
-
 docker compose ps
-
-View logs:
-
 docker compose logs -f
 
-Stop the application:
+To stop the application:
 
 docker compose down
 
@@ -59,8 +43,8 @@ GET| "/task_status/{task_id}"| Check task status
 
 Deployment
 
-Infrastructure as Code and CI/CD are used for cloud resource provisioning and automated deployment, according to the implemented configuration.
+Infrastructure as Code and CI/CD are used for cloud resource provisioning and automated deployment.
 
 Author
 
-Name: RAKSHITHA ITHARAJU 
+Name: Rakshitha Itharaju
