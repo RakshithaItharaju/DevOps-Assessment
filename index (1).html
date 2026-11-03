@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Background Task Demo</title>
+  <style>
+    :root { --bg:#f6f7f9; --card:#fff; --text:#1c2430; --muted:#667085; --line:#e4e7ec;
+            --accent:#2f5bea; --ok:#12805c; --warn:#b54708; --bad:#b42318; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg:#12151b; --card:#1b2029; --text:#e8ebf0; --muted:#98a2b3; --line:#2b3340;
+              --accent:#6b8cff; --ok:#3ccb97; --warn:#f5a54a; --bad:#ff7a70; }
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text);
+           font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    main { max-width:640px; margin:0 auto; padding:32px 16px; }
+    h1 { font-size:1.4rem; margin:0 0 4px; }
+    p.sub { margin:0 0 24px; color:var(--muted); }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+    label { display:block; font-size:.85rem; color:var(--muted); margin-bottom:6px; }
+    input { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px;
+            background:transparent; color:inherit; font:inherit; }
+    button { margin-top:12px; padding:10px 16px; border:0; border-radius:8px; background:var(--accent);
+             color:#fff; font:inherit; font-weight:600; cursor:pointer; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    .pill { padding:2px 10px; border-radius:999px; font-size:.8rem; font-weight:600;
+            border:1px solid currentColor; }
+    .PENDING, .QUEUED, .STARTED, .RETRY { color:var(--warn); }
+    .SUCCESS { color:var(--ok); }
+    .FAILURE, .ERROR { color:var(--bad); }
+    .idle { color:var(--muted); }
+    code, pre { font:.85rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    pre { margin:12px 0 0; padding:12px; background:var(--bg); border-radius:8px; overflow:auto; }
+    ul { list-style:none; padding:0; margin:12px 0 0; }
+    li { padding:6px 0; border-top:1px solid var(--line); font-size:.85rem; color:var(--muted); }
+    li:first-child { border-top:0; }
+    .hidden { display:none; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Background Task Demo</h1>
+  <p class="sub">Triggers a Celery task through the API and polls until it finishes.</p>
+
+  <section class="card">
+    <label for="message">Message</label>
+    <input id="message" value="Hello from the frontend" maxlength="500">
+    <button id="run">Run background task</button>
+  </section>
+
+  <section class="card">
+    <div class="row">
+      <strong>Task status</strong>
+      <span id="status" class="pill idle">idle</span>
+    </div>
+    <div id="taskId" class="hidden" style="margin-top:8px;color:var(--muted);font-size:.85rem">
+      Task ID: <code id="taskIdValue"></code>
+    </div>
+    <pre id="result" class="hidden"></pre>
+    <ul id="log"></ul>
+  </section>
+</main>
+
+<script>
+  // Same-origin by default (the API image serves this page). When the page is
+  // opened straight from disk, fall back to the local API. Override with ?api=URL.
+  const params = new URLSearchParams(location.search);
+  const API_BASE = (params.get("api") ||
+    (location.protocol === "file:" ? "http://localhost:8000" : "")).replace(/\/$/, "");
+
+  const POLL_MS = 1000;
+  const MAX_POLLS = 120; // give up after ~2 minutes
+
+  const $ = (id) => document.getElementById(id);
+  const runBtn = $("run"), statusEl = $("status"), resultEl = $("result"),
+        logEl = $("log"), taskIdBox = $("taskId");
+
+  function setStatus(s) {
+    statusEl.textContent = s;
+    statusEl.className = "pill " + s;
+  }
+
+  function log(text) {
+    const li = document.createElement("li");
+    li.textContent = new Date().toLocaleTimeString() + "  " + text;
+    logEl.prepend(li);
+  }
+
+  async function api(path, options) {
+    const res = await fetch(API_BASE + path, options);
+    if (!res.ok) throw new Error("HTTP " + res.status + " from " + path);
+    return res.json();
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  async function run() {
+    runBtn.disabled = true;
+    resultEl.classList.add("hidden");
+    logEl.textContent = "";
+    try {
+      const { task_id } = await api("/notify/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: $("message").value }),
+      });
+      $("taskIdValue").textContent = task_id;
+      taskIdBox.classList.remove("hidden");
+      setStatus("QUEUED");
+      log("Task queued");
+
+      let last = "";
+      for (let i = 0; i < MAX_POLLS; i++) {
+        await sleep(POLL_MS);
+        const data = await api("/task_status/" + encodeURIComponent(task_id));
+        if (data.status !== last) { setStatus(data.status); log("Status: " + data.status); last = data.status; }
+        if (data.status === "SUCCESS" || data.status === "FAILURE") {
+          resultEl.textContent = JSON.stringify(data.result ?? { error: data.error }, null, 2);
+          resultEl.classList.remove("hidden");
+          return;
+        }
+      }
+      setStatus("ERROR");
+      log("Timed out waiting for the task");
+    } catch (err) {
+      setStatus("ERROR");
+      log(err.message);
+    } finally {
+      runBtn.disabled = false;
+    }
+  }
+
+  runBtn.addEventListener("click", run);
+</script>
+</body>
+</html>

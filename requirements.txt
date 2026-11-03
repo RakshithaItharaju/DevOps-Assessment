@@ -1,0 +1,5 @@
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+# The [redis] extra pulls in a redis-py version that matches the installed kombu.
+celery[redis]>=5.3,<7
+redis>=5

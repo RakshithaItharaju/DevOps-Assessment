@@ -1,0 +1,149 @@
+name: ci-cd
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deployment at a time; never cancel a deploy that is half way through.
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_DIR: infra/terraform
+
+jobs:
+  test:
+    name: Test and build images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q tests
+
+      # Proves both Dockerfiles build on every pull request.
+      - name: Build images
+        run: docker compose build
+
+  validate-infra:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - run: terraform fmt -check -recursive infra
+
+      - name: Validate main stack
+        run: |
+          terraform -chdir=infra/terraform init -backend=false -input=false
+          terraform -chdir=infra/terraform validate
+
+      - name: Validate bootstrap stack
+        run: |
+          terraform -chdir=infra/bootstrap init -backend=false -input=false
+          terraform -chdir=infra/bootstrap validate
+
+  deploy:
+    name: Build, push and deploy
+    needs: [test, validate-infra]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write # lets the job request an OIDC token for AWS
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push api image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/notify-app-api:${{ github.sha }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build and push worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile.worker
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/notify-app-worker:${{ github.sha }}
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false # so `terraform output` returns clean text
+
+      - name: Terraform init
+        run: |
+          terraform -chdir=$TF_DIR init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="key=notify-app/prod.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform apply
+        env:
+          TF_VAR_image_tag: ${{ github.sha }}
+          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+          TF_VAR_alarm_email: ${{ vars.ALARM_EMAIL }}
+        run: |
+          terraform -chdir=$TF_DIR plan -input=false -out=tfplan
+          terraform -chdir=$TF_DIR apply -input=false tfplan
+
+      - name: Wait for the rollout to finish
+        run: |
+          CLUSTER=$(terraform -chdir=$TF_DIR output -raw ecs_cluster_name)
+          API=$(terraform -chdir=$TF_DIR output -raw api_service_name)
+          WORKER=$(terraform -chdir=$TF_DIR output -raw worker_service_name)
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$API" "$WORKER"
+
+      - name: Smoke test
+        run: |
+          URL=$(terraform -chdir=$TF_DIR output -raw app_url)
+          echo "Deployed to $URL"
+          curl --fail --silent --show-error --retry 10 --retry-delay 6 --retry-all-errors "$URL/health"
+
+          # End-to-end: enqueue a task and wait for the worker to finish it.
+          TASK=$(curl --fail --silent -X POST "$URL/notify/" \
+            -H 'Content-Type: application/json' -d '{"message":"smoke test"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["task_id"])')
+          for i in $(seq 1 30); do
+            STATUS=$(curl --fail --silent "$URL/task_status/$TASK" | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])')
+            echo "task $TASK: $STATUS"
+            [ "$STATUS" = "SUCCESS" ] && exit 0
+            sleep 2
+          done
+          echo "Task did not finish in time" >&2
+          exit 1
